@@ -1,29 +1,41 @@
 const express = require('express');
 const router = express.Router();
-const { getSignups, getApplications, applyFilters } = require('../services/sheets');
+const { getDataset, applyFilters, normEmail } = require('../services/sheets');
 
-const PRODUCTS = ['Volunteering Internship', 'Professional Internship', 'Teaching Internship'];
+// Canonical products, listed first. Anything else found in the sheet is
+// appended, so a renamed or added product still shows up instead of vanishing.
+const CANONICAL = ['Volunteering Internship', 'Professional Internship', 'Teaching Internship'];
 
-router.get('/', async (req, res) => {
+const shortName = name => name.replace(/\s*Internship$/i, '').trim() || name;
+const topKey = obj => Object.entries(obj).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A';
+
+router.get('/', async (req, res, next) => {
   try {
     const { member, dateFrom, dateTo } = req.query;
+    const { signups, applications, availability } = await getDataset();
 
-    const [signups, applications] = await Promise.all([getSignups(), getApplications()]);
     const filteredSignups = applyFilters(signups, { member, dateFrom, dateTo });
     const filteredApps = applyFilters(applications, { member, dateFrom, dateTo });
 
-    // Helper: Map emails to products from signups sheet
-    const emailToProduct = {};
-    signups.forEach(s => {
-      if (s.email) emailToProduct[s.email.toLowerCase().trim()] = s.product;
+    const appMap = new Map();
+    filteredApps.forEach(a => {
+      const email = normEmail(a.email);
+      if (!email || !a.personId) return;
+      if (!appMap.has(email)) appMap.set(email, new Set());
+      appMap.get(email).add(a.personId);
     });
 
-    // Per-product breakdown
+    const found = [...new Set(filteredSignups.map(s => s.product).filter(Boolean))];
+    const productNames = [
+      ...CANONICAL,
+      ...found.filter(p => !CANONICAL.includes(p)),
+    ];
+
     const productMap = {};
-    PRODUCTS.forEach(p => {
-      productMap[p] = {
-        name: p,
-        shortName: p.replace(' Internship', ''),
+    productNames.forEach(name => {
+      productMap[name] = {
+        name,
+        shortName: shortName(name),
         signups: 0,
         newAccounts: 0,
         applicants: new Set(),
@@ -37,36 +49,24 @@ router.get('/', async (req, res) => {
     });
 
     filteredSignups.forEach(s => {
-      const p = s.product;
-      if (!productMap[p]) return;
-      const pm = productMap[p];
+      const pm = productMap[s.product];
+      if (!pm) return;
+
       pm.signups++;
       if (s.isNewAccount) pm.newAccounts++;
-      const uni = s.university || 'Unknown';
-      pm.universities[uni] = (pm.universities[uni] || 0) + 1;
+      pm.universities[s.university || 'Unknown'] = (pm.universities[s.university || 'Unknown'] || 0) + 1;
       if (s.memberName) pm.members.add(s.memberName);
-      const f = s.fieldOfStudy || 'Unknown';
-      pm.fields[f] = (pm.fields[f] || 0) + 1;
-      const r = s.referral || 'Unknown';
-      pm.referrals[r] = (pm.referrals[r] || 0) + 1;
-      const y = s.yearOfStudy || 'Unknown';
-      pm.yearOfStudy[y] = (pm.yearOfStudy[y] || 0) + 1;
-      if (s.date) {
-        const date = s.date.toISOString().split('T')[0];
-        pm.byDate[date] = (pm.byDate[date] || 0) + 1;
-      }
+      pm.fields[s.fieldOfStudy || 'Unknown'] = (pm.fields[s.fieldOfStudy || 'Unknown'] || 0) + 1;
+      pm.referrals[s.referral || 'Unknown'] = (pm.referrals[s.referral || 'Unknown'] || 0) + 1;
+      pm.yearOfStudy[s.yearOfStudy || 'Unknown'] = (pm.yearOfStudy[s.yearOfStudy || 'Unknown'] || 0) + 1;
+      if (s.dateKey) pm.byDate[s.dateKey] = (pm.byDate[s.dateKey] || 0) + 1;
+
+      const pids = appMap.get(normEmail(s.email));
+      if (pids) pids.forEach(pid => pm.applicants.add(pid));
     });
 
-    // Add Applicants per product
-    filteredApps.forEach(a => {
-      const p = emailToProduct[a.email?.toLowerCase().trim()];
-      if (productMap[p] && a.personId) {
-        productMap[p].applicants.add(a.personId);
-      }
-    });
-
-    const products = PRODUCTS.map(p => {
-      const pm = productMap[p];
+    const products = productNames.map(name => {
+      const pm = productMap[name];
       return {
         name: pm.name,
         shortName: pm.shortName,
@@ -74,12 +74,15 @@ router.get('/', async (req, res) => {
         applicants: pm.applicants.size,
         newAccounts: pm.newAccounts,
         memberCount: pm.members.size,
-        memberList: [...pm.members],
-        topUniversity: Object.entries(pm.universities).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A',
-        topField: Object.entries(pm.fields).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A',
-        topReferral: Object.entries(pm.referrals).sort((a, b) => b[1] - a[1])[0]?.[0] || 'N/A',
+        memberList: [...pm.members].sort(),
+        conversionRate: pm.signups > 0
+          ? Number(((pm.applicants.size / pm.signups) * 100).toFixed(1))
+          : 0,
+        topUniversity: topKey(pm.universities),
+        topField: topKey(pm.fields),
+        topReferral: topKey(pm.referrals),
         universities: Object.entries(pm.universities)
-          .map(([name, count]) => ({ name, count }))
+          .map(([n, count]) => ({ name: n, count }))
           .sort((a, b) => b.count - a.count)
           .slice(0, 10),
         fields: Object.entries(pm.fields)
@@ -98,35 +101,32 @@ router.get('/', async (req, res) => {
       };
     });
 
-    // Comparison: product share (driven by signups)
     const totalAll = filteredSignups.length;
     const productShare = products.map(p => ({
       name: p.shortName,
       count: p.signups,
-      percentage: totalAll > 0 ? ((p.signups / totalAll) * 100).toFixed(1) : 0,
+      percentage: totalAll > 0 ? Number(((p.signups / totalAll) * 100).toFixed(1)) : 0,
     }));
 
-    // Combined time series for all products
     const allDates = new Set();
     products.forEach(p => p.timeSeries.forEach(d => allDates.add(d.date)));
     const combinedTimeSeries = [...allDates].sort().map(date => {
       const entry = { date };
       products.forEach(p => {
-        const found = p.timeSeries.find(d => d.date === date);
-        entry[p.shortName] = found ? found.count : 0;
+        entry[p.shortName] = p.timeSeries.find(d => d.date === date)?.count || 0;
       });
       return entry;
     });
 
     res.json({
+      availability,
       products,
       productShare,
       combinedTimeSeries,
       totalSignups: totalAll,
     });
   } catch (err) {
-    console.error('Products error:', err);
-    res.status(500).json({ error: err.message });
+    next(err);
   }
 });
 

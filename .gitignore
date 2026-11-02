@@ -1,5 +1,10 @@
 node_modules
+
+# Real secrets — never commit
 .env
 .env.local
-.env.example
 mkt-tracker.json
+*-service-account.json
+
+# .env.example is intentionally NOT ignored: it holds placeholders only and
+# documents the required configuration for anyone setting the project up.
