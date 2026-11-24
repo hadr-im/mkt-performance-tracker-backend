@@ -287,6 +287,15 @@ const MEMBER_ALIASES = {
   'Maysaa gana': 'Mayssa Gana',
   'Rihem ben slimene': 'rihem ben slimen',
   'Mokhtar BarKetallah': 'Mokthar Barketallah',
+
+  // Confirmed 2026-11-24 against the Departments tab. Each left-hand spelling
+  // appeared only in the leads sheet and was costing its department the
+  // signups shown in brackets.
+  'nadin chegham': 'nadine jgham',          // 25 signups -> IGV
+  'Ryhem Ben Slimene': 'rihem ben slimen',  // 17 signups -> OGV ("Rihem…" variant above is a separate key)
+  'Maryem Gandouz': 'Mariam gandouz',       // 11 signups -> OGTe
+  'Amine Touati': 'Med Amine Touati',       //  7 signups -> PM (distinct from Med Salah Touati, OGTe)
+  'Selim Boudagga': 'Selim Bouddega',       //  4 signups -> IM
 };
 
 const ALIAS_BY_KEY = new Map(
@@ -495,12 +504,35 @@ async function getAvailability() {
  * applications respond to the member filter exactly like signups do.
  */
 async function getDataset() {
-  const [signups, rawApplications, directory, availability] = await Promise.all([
+  const [rawSignups, rawApplications, directory, availability] = await Promise.all([
     getSignups(),
     getApplications(),
     getMemberDirectory(),
     getAvailability(),
   ]);
+
+  /* Snap each signup's member name to the Departments-tab spelling.
+   *
+   * Members type their own name into the signup form, so the same person
+   * arrives as "Ameni Aissaoui" on one row and "Ameni aissaoui" on the next.
+   * Routes group by the raw string, so without this one person becomes two
+   * rows that split their own signups between them.
+   *
+   * nameKey ignores case, accents, spacing and punctuation, so this collapses
+   * every variant that differs only in how it was typed. Genuinely different
+   * spellings ("Selim Boudagga" vs "Selim Bouddega") produce different keys
+   * and still need an entry in MEMBER_ALIASES.
+   *
+   * The Departments tab is the source of truth: its spelling wins, so the
+   * name shown in the UI always matches the roster it is looked up against.
+   */
+  const rosterByKey = new Map(directory.map(({ name }) => [nameKey(name), name]));
+  const signups = rawSignups.map(s => {
+    const canonical = rosterByKey.get(nameKey(s.memberName));
+    return canonical && canonical !== s.memberName
+      ? { ...s, memberName: canonical }
+      : s;
+  });
 
   const membersInfo = {};
   directory.forEach(({ name, department }) => {
